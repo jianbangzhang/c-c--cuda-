@@ -1,15 +1,22 @@
+# model3_v3.py
 import streamlit as st
 import torch
 import threading
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 NEW_MAX_TOKENS = 3072
-# 模型加载
+
+# ------------------------- 模型加载（优化后分离） -------------------------
+@st.cache_resource
+def load_tokenizer():
+    model_path = "/home/whu/qwen3/model"
+    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
 @st.cache_resource
 def load_model():
     model_path = "/home/whu/qwen3/model"
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
@@ -20,11 +27,12 @@ def load_model():
     if torch.cuda.is_available():
         model.half()
         torch.backends.cudnn.benchmark = True
-    return model, tokenizer
+    return model
 
-model, tokenizer = load_model()
+tokenizer = load_tokenizer()
+model = load_model()
 
-# 流式生成
+# ------------------------- 通用流式生成 -------------------------
 def stream_generate_response(prompt, enable_thinking, max_new_tokens=NEW_MAX_TOKENS):
     messages = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(
@@ -51,7 +59,13 @@ def stream_generate_response(prompt, enable_thinking, max_new_tokens=NEW_MAX_TOK
     for new_text in streamer:
         yield new_text
 
-# 按结构模块分块提取代码
+def run_stream_analysis(func, code, enable_thinking):
+    result = ""
+    for chunk in func(code, enable_thinking):
+        result += chunk
+    return result
+
+# ------------------------- 三种分析方法 -------------------------
 def explain_cpp_block(code,enable_thinking):
     prompt = f"""任务: 请你扮演一个经验丰富的C语言/c++/cuda代码分析师。你的任务是对我接下来提供的C代码进行详细分析，识别其中的关键元素，并将代码逻辑上分块。
 具体步骤:
@@ -108,55 +122,51 @@ st.markdown("""
 
 st.set_page_config(page_title="代码结构分块与解释", layout="wide")
 code = st.text_area("请输入代码或任务：", height=300)
-
 mode = st.radio("选择分析模式：", ["⚡ 快速分析", "🌊 深度分析"])
 enable_thinking = mode.startswith("🌊")
 
 if st.button("🧹 清理模型缓存"):
     load_model.clear()
+    load_tokenizer.clear()
     st.success("✅ 模型缓存已清除。下次分析将重新加载模型。")
 
 if st.button("🚀 开始分块分析"):
     if not code.strip():
-        st.warning("请输入有效的 C++ 代码")
+        st.warning("请输入有效的代码或任务：")
     else:
-        # ✅ 清理缓存：初始化所有展示文本变量
-        explanation = ""
-        perf_result = ""
-        opt_result = ""
-        all_results = ""
-
-        all_results += f"# ⏱️ 分析时间：{datetime.datetime.now()}\n\n"
+        all_results = f"# ⏱️ 分析时间：{datetime.datetime.now()}\n\n"
         all_results += f"## 💻 输入代码\n```cpp\n{code}\n```\n\n"
 
-        # ✅ 分块解释
+        # ✅ 第1部分：结构分块分析（流式）
         st.markdown("## 🧱 分块结构解释")
         with st.expander("🔍 点击展开结构分析", expanded=True):
-            explain_area = st.empty()  # 重新定义展示区域
+            explanation = ""
+            explain_area = st.empty()
             for chunk in explain_cpp_block(code, enable_thinking):
                 explanation += chunk
                 explain_area.markdown(explanation)
             all_results += f"## 🔍 分块解释\n{explanation}\n\n"
 
-        # ✅ 性能分析
+        # ✅ 第2部分：性能分析 + 优化建议（并发加速）
+        with st.spinner("正在分析性能与优化建议..."):
+            with ThreadPoolExecutor() as executor:
+                perf_future = executor.submit(run_stream_analysis, analyze_performance, code, enable_thinking)
+                opt_future = executor.submit(run_stream_analysis, analyze_optimization, code, enable_thinking)
+
+                perf_result = perf_future.result()
+                opt_result = opt_future.result()
+
         st.markdown("## 📈 性能分析")
         with st.expander("💬 点击展开性能分析", expanded=True):
-            perf_area = st.empty()
-            for chunk in analyze_performance(code, enable_thinking):
-                perf_result += chunk
-                perf_area.markdown(perf_result)
-            all_results += f"## 📈 性能分析\n{perf_result}\n\n"
+            st.markdown(perf_result)
+        all_results += f"## 📈 性能分析\n{perf_result}\n\n"
 
-        # ✅ 优化建议
         st.markdown("## 🛠 优化建议")
         with st.expander("💬 点击展开优化建议", expanded=True):
-            opt_area = st.empty()
-            for chunk in analyze_optimization(code, enable_thinking):
-                opt_result += chunk
-                opt_area.markdown(opt_result)
-            all_results += f"## 🛠 优化建议\n{opt_result}\n\n"
+            st.markdown(opt_result)
+        all_results += f"## 🛠 优化建议\n{opt_result}\n\n"
 
-        # ✅ 导出按钮
+        # ✅ Markdown 导出
         filename = f"code_analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
         st.download_button(
             label="💾 保存分析结果为 Markdown 文件",
@@ -172,5 +182,5 @@ st.markdown("""
 - ✅ 自动结构分析 + 性能瓶颈分析 + 优化建议
 - ✅ 流式逐块输出 + 一键保存为 Markdown
 - ✅ 分析模式切换 + 缓存清理按钮
+- ✅ 分析过程多线程并发，加速运行
 """)
-
